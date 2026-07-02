@@ -1,5 +1,10 @@
 .PHONY: install lint format typecheck test test-live check
 
+# This is a public repo: never resolve against a locally configured private
+# index (e.g. the CodeArtifact default set by corporate shell integrations).
+unexport UV_DEFAULT_INDEX
+unexport UV_INDEX_URL
+
 install:
 	uv sync
 
