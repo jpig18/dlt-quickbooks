@@ -37,6 +37,8 @@ known-first-party = ["quickbooks"]
 
 [lint.per-file-ignores]
 "tests/**" = ["D"]
+# demo pipeline scripts print load info by convention
+"sources/*_pipeline.py" = ["T201"]
 
 [format]
 docstring-code-format = true
