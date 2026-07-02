@@ -26,6 +26,10 @@ ignore = [
     "D205",
 ]
 
+[lint.flake8-bugbear]
+# dlt's canonical idiom: incremental cursors are declared as argument defaults
+extend-immutable-calls = ["dlt.sources.incremental"]
+
 [lint.pycodestyle]
 max-doc-length = 100
 

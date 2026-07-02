@@ -8,15 +8,18 @@ reports, attachments, and the Payments API live alongside in this package.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any, cast
 
 import dlt
+import pendulum
 from dlt.sources import DltResource
+from dlt.sources.helpers.rest_client.client import RESTClient
 from dlt.sources.rest_api import rest_api_resources
 from dlt.sources.rest_api.typing import RESTAPIConfig
 
 from .helpers.auth import FileTokenStore, QboRefreshTokenAuth, TokenStore
+from .helpers.cdc import CDC_MAX_LOOKBACK_DAYS, clamp_changed_since, parse_cdc_response
 from .helpers.paginator import QboQueryPaginator
 from .settings import (
     BASE_URLS,
@@ -26,7 +29,29 @@ from .settings import (
     to_snake_case,
 )
 
-__all__ = ["FileTokenStore", "QboRefreshTokenAuth", "TokenStore", "quickbooks"]
+__all__ = [
+    "FileTokenStore",
+    "QboRefreshTokenAuth",
+    "TokenStore",
+    "quickbooks",
+    "quickbooks_cdc",
+]
+
+
+def _build_auth(
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    token_store_path: str | None,
+    token_store: TokenStore | None,
+) -> QboRefreshTokenAuth:
+    return QboRefreshTokenAuth(
+        client_id=client_id,
+        client_secret=client_secret,
+        refresh_token=refresh_token,
+        token_store=token_store
+        or (FileTokenStore(token_store_path) if token_store_path else None),
+    )
 
 
 @dlt.source(name="quickbooks", max_table_nesting=2)
@@ -67,12 +92,8 @@ def quickbooks(
     Yields:
         One dlt resource per configured entity.
     """
-    auth = QboRefreshTokenAuth(
-        client_id=client_id,
-        client_secret=client_secret,
-        refresh_token=refresh_token,
-        token_store=token_store
-        or (FileTokenStore(token_store_path) if token_store_path else None),
+    auth = _build_auth(
+        client_id, client_secret, refresh_token, token_store_path, token_store
     )
 
     selected: set[str] | None = None
@@ -123,3 +144,95 @@ def quickbooks(
         },
     )
     yield from rest_api_resources(config)
+
+
+# The CDC source shares the schema name ("quickbooks") and config section with
+# the core source so its rows merge into the same per-entity tables.
+@dlt.source(name="quickbooks", section="quickbooks", max_table_nesting=2)
+def quickbooks_cdc(
+    client_id: str = dlt.secrets.value,
+    client_secret: str = dlt.secrets.value,
+    refresh_token: str = dlt.secrets.value,
+    realm_id: str = dlt.secrets.value,
+    environment: str = "production",
+    token_store_path: str | None = "qbo_token.json",
+    token_store: TokenStore | None = None,
+    entities: list[str] | None = None,
+    initial_changed_since: str | None = None,
+    lookback_days: int = CDC_MAX_LOOKBACK_DAYS,
+) -> Iterable[DltResource]:
+    """Change Data Capture: adds, updates, and hard deletes since the last run.
+
+    Fetches ``/cdc`` for all CDC-eligible entities and dispatches rows into the
+    same tables as the core ``quickbooks`` source (merge on ``Id``). Deleted
+    records arrive as minimal objects and are flagged with ``_qbo_deleted=True``
+    (their other columns become NULL on merge). Intended operating pattern:
+    one full load with ``quickbooks()``, then frequent ``quickbooks_cdc()`` runs
+    — CDC also captures hard deletes, which query-based loads never see.
+
+    Args:
+        client_id: Intuit app OAuth2 client id.
+        client_secret: Intuit app OAuth2 client secret.
+        refresh_token: Initial OAuth2 refresh token.
+        realm_id: QuickBooks company id.
+        environment: "production" or "sandbox".
+        token_store_path: Path for the default file-based token store. Ignored
+            when ``token_store`` is given.
+        token_store: Custom ``TokenStore`` implementation.
+        entities: Optional subset of CDC-eligible entities, by API name
+            ("Invoice") or resource name ("invoice").
+        initial_changed_since: ISO 8601 lower bound for the first run.
+            Defaults to ``lookback_days`` ago (the CDC maximum).
+        lookback_days: CDC lookback window; Intuit rejects anything over 30.
+
+    Yields:
+        A single resource that dispatches rows to per-entity tables.
+    """
+    auth = _build_auth(
+        client_id, client_secret, refresh_token, token_store_path, token_store
+    )
+    client = RESTClient(
+        base_url=f"{BASE_URLS[environment]}/v3/company/{realm_id}/",
+        auth=auth,
+        headers={"Accept": "application/json"},
+    )
+
+    cdc_entities = [e.name for e in ENTITIES if e.cdc]
+    if entities is not None:
+        selected = {to_snake_case(e) for e in entities}
+        cdc_entities = [n for n in cdc_entities if to_snake_case(n) in selected]
+
+    initial = (
+        initial_changed_since
+        or pendulum.now("UTC").subtract(days=lookback_days).isoformat()
+    )
+
+    @dlt.resource(
+        name="qbo_cdc",
+        table_name=lambda row: to_snake_case(cast(str, row["_qbo_entity"])),
+        primary_key="Id",
+        write_disposition="merge",
+    )
+    def cdc(
+        changed_since: dlt.sources.incremental[str] = dlt.sources.incremental(
+            "MetaData.LastUpdatedTime",
+            initial_value=initial,
+            on_cursor_value_missing="include",
+        ),
+    ) -> Iterator[dict[str, Any]]:
+        since = clamp_changed_since(changed_since.start_value or initial, lookback_days)
+        response = client.get(
+            "cdc",
+            params={
+                "entities": ",".join(cdc_entities),
+                "changedSince": since,
+                "minorversion": MINOR_VERSION,
+            },
+        )
+        response.raise_for_status()
+        for entity_name, record in parse_cdc_response(response.json()):
+            record["_qbo_entity"] = entity_name
+            record["_qbo_deleted"] = record.get("status") == "Deleted"
+            yield record
+
+    yield cdc
