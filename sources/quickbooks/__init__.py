@@ -14,12 +14,14 @@ from typing import Any, cast
 import dlt
 import pendulum
 from dlt.sources import DltResource
+from dlt.sources.helpers import requests as dlt_requests
 from dlt.sources.helpers.rest_client.client import RESTClient
 from dlt.sources.rest_api import rest_api_resources
 from dlt.sources.rest_api.typing import RESTAPIConfig
 
 from .helpers.auth import FileTokenStore, QboRefreshTokenAuth, TokenStore
 from .helpers.cdc import CDC_MAX_LOOKBACK_DAYS, clamp_changed_since, parse_cdc_response
+from .helpers.files import sanitize_filename, write_bytes
 from .helpers.paginator import QboQueryPaginator
 from .helpers.reports import flatten_report
 from .settings import (
@@ -37,8 +39,12 @@ __all__ = [
     "TokenStore",
     "quickbooks",
     "quickbooks_cdc",
+    "quickbooks_files",
     "quickbooks_reports",
 ]
+
+# Entities whose transaction PDFs can be fetched via GET /{entity}/{id}/pdf.
+PDF_ENTITIES_DEFAULT = ("Invoice", "Estimate", "SalesReceipt", "CreditMemo")
 
 
 def _build_auth(
@@ -320,3 +326,133 @@ def quickbooks_reports(
             params["end_date"] = end_date
         params.update((report_params or {}).get(report_name, {}))
         yield make_report_resource(report_name, params)
+
+
+@dlt.source(name="quickbooks", section="quickbooks", max_table_nesting=2)
+def quickbooks_files(
+    files_url: str,
+    client_id: str = dlt.secrets.value,
+    client_secret: str = dlt.secrets.value,
+    refresh_token: str = dlt.secrets.value,
+    realm_id: str = dlt.secrets.value,
+    environment: str = "production",
+    token_store_path: str | None = "qbo_token.json",
+    token_store: TokenStore | None = None,
+    pdf_entities: list[str] | None = None,
+    initial_timestamp: str = DEFAULT_INITIAL_TIMESTAMP,
+) -> Iterable[DltResource]:
+    """Attachable file binaries and transaction PDFs.
+
+    Two resources:
+
+    - ``attachable``: Attachable metadata (merged into the same table the core
+      source loads) with each binary downloaded via its ``TempDownloadUri`` to
+      ``{files_url}/attachable/{Id}/{FileName}`` and recorded in
+      ``_qbo_file_path``. Note-only attachables (no file) are skipped.
+    - ``entity_pdf``: the QBO-rendered PDF for each transaction of the
+      configured entity types, downloaded to
+      ``{files_url}/pdf/{entity}/{Id}.pdf`` with one metadata row per file.
+
+    Both resources load incrementally on ``Metadata.LastUpdatedTime``, so only
+    new/updated files are downloaded on re-runs.
+
+    Args:
+        files_url: fsspec-compatible base URL for binaries — a local directory
+            path, ``s3://bucket/prefix``, ``gs://…``, etc.
+        client_id: Intuit app OAuth2 client id.
+        client_secret: Intuit app OAuth2 client secret.
+        refresh_token: Initial OAuth2 refresh token.
+        realm_id: QuickBooks company id.
+        environment: "production" or "sandbox".
+        token_store_path: Path for the default file-based token store. Ignored
+            when ``token_store`` is given.
+        token_store: Custom ``TokenStore`` implementation.
+        pdf_entities: Entity types to fetch PDFs for. Defaults to Invoice,
+            Estimate, SalesReceipt, and CreditMemo.
+        initial_timestamp: Lower bound for the first incremental load,
+            ISO 8601.
+
+    Yields:
+        The ``attachable`` and ``entity_pdf`` resources.
+    """
+    auth = _build_auth(
+        client_id, client_secret, refresh_token, token_store_path, token_store
+    )
+    client = RESTClient(
+        base_url=f"{BASE_URLS[environment]}/v3/company/{realm_id}/",
+        auth=auth,
+        headers={"Accept": "application/json"},
+    )
+
+    def query_pages(query: str) -> Iterator[list[dict[str, Any]]]:
+        entity_name = query.split(" FROM ")[1].split(" ")[0]
+        yield from client.paginate(
+            "query",
+            params={"query": query, "minorversion": MINOR_VERSION},
+            paginator=QboQueryPaginator(),
+            data_selector=f"QueryResponse.{entity_name}",
+        )
+
+    @dlt.resource(name="attachable", primary_key="Id", write_disposition="merge")
+    def attachables(
+        updated: dlt.sources.incremental[str] = dlt.sources.incremental(
+            "MetaData.LastUpdatedTime", initial_value=initial_timestamp
+        ),
+    ) -> Iterator[dict[str, Any]]:
+        query = (
+            "SELECT * FROM Attachable"
+            f" WHERE Metadata.LastUpdatedTime >= '{updated.start_value}'"
+            " ORDERBY Metadata.LastUpdatedTime"
+        )
+        for page in query_pages(query):
+            for record in page:
+                download_uri = record.get("TempDownloadUri")
+                if download_uri:
+                    file_name = sanitize_filename(
+                        record.get("FileName") or record["Id"]
+                    )
+                    content = dlt_requests.get(download_uri).content
+                    record["_qbo_file_path"] = write_bytes(
+                        files_url, f"attachable/{record['Id']}/{file_name}", content
+                    )
+                yield record
+
+    @dlt.resource(
+        name="entity_pdf", primary_key=("entity", "id"), write_disposition="merge"
+    )
+    def entity_pdfs(
+        updated: dlt.sources.incremental[str] = dlt.sources.incremental(
+            "last_updated_time", initial_value=initial_timestamp
+        ),
+    ) -> Iterator[dict[str, Any]]:
+        for entity_name in pdf_entities or list(PDF_ENTITIES_DEFAULT):
+            query = (
+                f"SELECT Id, Metadata.LastUpdatedTime FROM {entity_name}"
+                f" WHERE Metadata.LastUpdatedTime >= '{updated.start_value}'"
+                " ORDERBY Metadata.LastUpdatedTime"
+            )
+            for page in query_pages(query):
+                for record in page:
+                    entity_id = record["Id"]
+                    response = client.get(
+                        f"{entity_name.lower()}/{entity_id}/pdf",
+                        params={"minorversion": MINOR_VERSION},
+                        headers={"Accept": "application/pdf"},
+                    )
+                    response.raise_for_status()
+                    path = write_bytes(
+                        files_url,
+                        f"pdf/{entity_name.lower()}/{entity_id}.pdf",
+                        response.content,
+                    )
+                    yield {
+                        "entity": entity_name,
+                        "id": entity_id,
+                        "last_updated_time": record.get("MetaData", {}).get(
+                            "LastUpdatedTime"
+                        ),
+                        "_qbo_file_path": path,
+                    }
+
+    yield attachables
+    yield entity_pdfs
