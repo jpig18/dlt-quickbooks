@@ -90,6 +90,42 @@ ENTITIES: tuple[EntityConfig, ...] = (
 )
 
 
+# Reports API endpoints (GET /v3/company/{realmId}/reports/<name>). All accept
+# optional query params (date ranges, accounting_method, summarize_column_by,
+# …) and default to a sensible current period when called without params.
+# Responses are capped at 400,000 cells — window large reports by date.
+REPORTS: tuple[str, ...] = (
+    "AccountList",
+    "AgedPayableDetail",
+    "AgedPayables",
+    "AgedReceivableDetail",
+    "AgedReceivables",
+    "BalanceSheet",
+    "CashFlow",
+    "ClassSales",
+    "CustomerBalance",
+    "CustomerBalanceDetail",
+    "CustomerIncome",
+    "CustomerSales",
+    "DepartmentSales",
+    "GeneralLedger",
+    "InventoryValuationDetail",
+    "InventoryValuationSummary",
+    "ItemSales",
+    "JournalReport",
+    "ProfitAndLoss",
+    "ProfitAndLossDetail",
+    "TaxSummary",
+    "TransactionList",
+    "TransactionListByCustomer",
+    "TransactionListByVendor",
+    "TrialBalance",
+    "VendorBalance",
+    "VendorBalanceDetail",
+    "VendorExpenses",
+)
+
+
 def to_snake_case(entity_name: str) -> str:
     """Convert an API entity name to a snake_case resource/table name."""
     return re.sub(r"(?<!^)(?=[A-Z])", "_", entity_name).lower()

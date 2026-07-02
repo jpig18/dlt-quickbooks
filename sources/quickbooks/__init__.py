@@ -21,11 +21,13 @@ from dlt.sources.rest_api.typing import RESTAPIConfig
 from .helpers.auth import FileTokenStore, QboRefreshTokenAuth, TokenStore
 from .helpers.cdc import CDC_MAX_LOOKBACK_DAYS, clamp_changed_since, parse_cdc_response
 from .helpers.paginator import QboQueryPaginator
+from .helpers.reports import flatten_report
 from .settings import (
     BASE_URLS,
     DEFAULT_INITIAL_TIMESTAMP,
     ENTITIES,
     MINOR_VERSION,
+    REPORTS,
     to_snake_case,
 )
 
@@ -35,6 +37,7 @@ __all__ = [
     "TokenStore",
     "quickbooks",
     "quickbooks_cdc",
+    "quickbooks_reports",
 ]
 
 
@@ -236,3 +239,84 @@ def quickbooks_cdc(
             yield record
 
     yield cdc
+
+
+@dlt.source(name="quickbooks", section="quickbooks", max_table_nesting=0)
+def quickbooks_reports(
+    client_id: str = dlt.secrets.value,
+    client_secret: str = dlt.secrets.value,
+    refresh_token: str = dlt.secrets.value,
+    realm_id: str = dlt.secrets.value,
+    environment: str = "production",
+    token_store_path: str | None = "qbo_token.json",
+    token_store: TokenStore | None = None,
+    reports: list[str] | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    report_params: dict[str, dict[str, str]] | None = None,
+) -> Iterable[DltResource]:
+    """Computed financial reports (P&L, Balance Sheet, GL, agings, …).
+
+    Each report loads into its own ``report_<name>`` table with
+    ``write_disposition="replace"``: reports are computed views over a period,
+    not entities, so every run replaces the table with the freshly generated
+    report. Snapshot downstream (or window with ``start_date``/``end_date``
+    per run) if you need report history. Responses are capped by Intuit at
+    400,000 cells — window large reports (e.g. GeneralLedger) by date.
+
+    Args:
+        client_id: Intuit app OAuth2 client id.
+        client_secret: Intuit app OAuth2 client secret.
+        refresh_token: Initial OAuth2 refresh token.
+        realm_id: QuickBooks company id.
+        environment: "production" or "sandbox".
+        token_store_path: Path for the default file-based token store. Ignored
+            when ``token_store`` is given.
+        token_store: Custom ``TokenStore`` implementation.
+        reports: Report names to load (see ``settings.REPORTS``). Defaults to
+            every report in the registry; reports a company has no data for
+            simply produce empty tables.
+        start_date: Optional ``start_date`` param applied to all reports
+            (YYYY-MM-DD). Without it, QBO defaults each report's period.
+        end_date: Optional ``end_date`` param applied to all reports.
+        report_params: Per-report query-param overrides, keyed by report name,
+            e.g. ``{"ProfitAndLoss": {"summarize_column_by": "Month"}}``.
+            Merged over ``start_date``/``end_date``.
+
+    Yields:
+        One dlt resource per report.
+    """
+    auth = _build_auth(
+        client_id, client_secret, refresh_token, token_store_path, token_store
+    )
+    client = RESTClient(
+        base_url=f"{BASE_URLS[environment]}/v3/company/{realm_id}/",
+        auth=auth,
+        headers={"Accept": "application/json"},
+    )
+
+    selected_reports = list(REPORTS)
+    if reports is not None:
+        registry = {r.lower(): r for r in REPORTS}
+        selected_reports = [registry.get(r.lower(), r) for r in reports]
+
+    def make_report_resource(report_name: str, params: dict[str, str]) -> DltResource:
+        def fetch_report() -> Iterator[dict[str, Any]]:
+            response = client.get(f"reports/{report_name}", params=params)
+            response.raise_for_status()
+            yield from flatten_report(response.json())
+
+        return dlt.resource(
+            fetch_report,
+            name=f"report_{to_snake_case(report_name)}",
+            write_disposition="replace",
+        )
+
+    for report_name in selected_reports:
+        params: dict[str, str] = {"minorversion": MINOR_VERSION}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        params.update((report_params or {}).get(report_name, {}))
+        yield make_report_resource(report_name, params)
