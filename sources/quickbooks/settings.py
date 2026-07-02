@@ -12,6 +12,13 @@ BASE_URLS = {
     "sandbox": "https://sandbox-quickbooks.api.intuit.com",
 }
 
+# QuickBooks Payments API (separate product; requires the
+# com.intuit.quickbooks.payment OAuth scope on the refresh token).
+PAYMENTS_BASE_URLS = {
+    "production": "https://api.intuit.com/quickbooks/v4/payments",
+    "sandbox": "https://sandbox.api.intuit.com/quickbooks/v4/payments",
+}
+
 # As of Aug 1, 2025 Intuit consolidated minor versions: 75 is the baseline and
 # lower values are ignored.
 MINOR_VERSION = "75"

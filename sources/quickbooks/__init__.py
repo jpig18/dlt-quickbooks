@@ -29,6 +29,7 @@ from .settings import (
     DEFAULT_INITIAL_TIMESTAMP,
     ENTITIES,
     MINOR_VERSION,
+    PAYMENTS_BASE_URLS,
     REPORTS,
     to_snake_case,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "quickbooks",
     "quickbooks_cdc",
     "quickbooks_files",
+    "quickbooks_payments",
     "quickbooks_reports",
 ]
 
@@ -456,3 +458,92 @@ def quickbooks_files(
 
     yield attachables
     yield entity_pdfs
+
+
+@dlt.source(name="quickbooks", section="quickbooks", max_table_nesting=2)
+def quickbooks_payments(
+    client_id: str = dlt.secrets.value,
+    client_secret: str = dlt.secrets.value,
+    refresh_token: str = dlt.secrets.value,
+    realm_id: str = dlt.secrets.value,
+    environment: str = "production",
+    token_store_path: str | None = "qbo_token.json",
+    token_store: TokenStore | None = None,
+    customer_ids: list[str] | None = None,
+) -> Iterable[DltResource]:
+    """QuickBooks Payments API: stored cards and bank accounts per customer.
+
+    Requires QuickBooks Payments to be enabled on the company and the
+    ``com.intuit.quickbooks.payment`` OAuth scope on the refresh token.
+
+    The Payments API has no list endpoints for charges, refunds, or e-checks —
+    they are retrievable by id only, and their ledger impact already flows
+    through the Accounting entities (Payment, Deposit, …) in the core source.
+    What it does expose for syncing are the payment methods stored per
+    customer, loaded here as ``payment_card`` and ``payment_bank_account``.
+
+    Args:
+        client_id: Intuit app OAuth2 client id.
+        client_secret: Intuit app OAuth2 client secret.
+        refresh_token: Initial OAuth2 refresh token (must carry the payments
+            scope).
+        realm_id: QuickBooks company id.
+        environment: "production" or "sandbox".
+        token_store_path: Path for the default file-based token store. Ignored
+            when ``token_store`` is given.
+        token_store: Custom ``TokenStore`` implementation.
+        customer_ids: Customers to fetch payment methods for. Defaults to all
+            customer ids from the Accounting API.
+
+    Yields:
+        The ``payment_card`` and ``payment_bank_account`` resources.
+    """
+    auth = _build_auth(
+        client_id, client_secret, refresh_token, token_store_path, token_store
+    )
+    accounting_client = RESTClient(
+        base_url=f"{BASE_URLS[environment]}/v3/company/{realm_id}/",
+        auth=auth,
+        headers={"Accept": "application/json"},
+    )
+    payments_client = RESTClient(
+        base_url=f"{PAYMENTS_BASE_URLS[environment]}/",
+        auth=auth,
+        headers={"Accept": "application/json"},
+    )
+
+    def iter_customer_ids() -> Iterator[str]:
+        if customer_ids is not None:
+            yield from customer_ids
+            return
+        for page in accounting_client.paginate(
+            "query",
+            params={"query": "SELECT Id FROM Customer", "minorversion": MINOR_VERSION},
+            paginator=QboQueryPaginator(),
+            data_selector="QueryResponse.Customer",
+        ):
+            for record in page:
+                yield str(record["Id"])
+
+    def fetch_payment_methods(path_suffix: str) -> Iterator[dict[str, Any]]:
+        for customer_id in iter_customer_ids():
+            response = payments_client.get(f"customers/{customer_id}/{path_suffix}")
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            for record in response.json() or []:
+                record["customer_id"] = customer_id
+                yield record
+
+    @dlt.resource(name="payment_card", primary_key="id", write_disposition="merge")
+    def cards() -> Iterator[dict[str, Any]]:
+        yield from fetch_payment_methods("cards")
+
+    @dlt.resource(
+        name="payment_bank_account", primary_key="id", write_disposition="merge"
+    )
+    def bank_accounts() -> Iterator[dict[str, Any]]:
+        yield from fetch_payment_methods("bank-accounts")
+
+    yield cards
+    yield bank_accounts
