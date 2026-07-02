@@ -1,0 +1,21 @@
+# secrets — only the .example template is committed
+.dlt/secrets.toml
+.dlt/*.local.toml
+qbo_token.json
+
+# python
+.venv/
+__pycache__/
+*.py[cod]
+dist/
+*.egg-info/
+
+# tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# dlt / pipeline artifacts
+_storage/
+*.duckdb
+*.duckdb.wal

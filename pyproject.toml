@@ -1,0 +1,52 @@
+[project]
+name = "dlt-quickbooks"
+version = "0.1.0"
+description = "dlt source for QuickBooks Online: full Accounting API coverage with incremental loading, CDC, reports, attachments, and the Payments API"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "John Pignato" }]
+requires-python = ">=3.10"
+keywords = ["dlt", "quickbooks", "quickbooks-online", "elt", "data-pipeline"]
+dependencies = [
+    "dlt>=1.19.0",
+]
+
+[project.urls]
+Repository = "https://github.com/jpig18/dlt-quickbooks"
+
+[dependency-groups]
+dev = [
+    "dlt[duckdb]>=1.19.0",
+    "mypy>=1.14",
+    "pytest>=8.3",
+    "requests-mock>=1.12",
+    "ruff>=0.9",
+    "types-requests",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9.0"]
+build-backend = "uv_build"
+
+# The importable package lives at sources/quickbooks so the repo stays
+# consumable via `dlt init quickbooks <destination> --location <this repo>`
+# (verified-sources layout) while also building as a pip package.
+[tool.uv.build-backend]
+module-root = "sources"
+module-name = "quickbooks"
+
+[tool.pytest.ini_options]
+addopts = "--tb=short -v"
+testpaths = ["tests"]
+markers = [
+    "live: integration tests that require Intuit sandbox credentials",
+]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["sources", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["fsspec.*", "requests_mock.*"]
+ignore_missing_imports = true
