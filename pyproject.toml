@@ -28,6 +28,12 @@ dev = [
 requires = ["uv_build>=0.8.17,<0.9.0"]
 build-backend = "uv_build"
 
+# Public repo: always resolve against PyPI, not any locally configured index.
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
 # The importable package lives at sources/quickbooks so the repo stays
 # consumable via `dlt init quickbooks <destination> --location <this repo>`
 # (verified-sources layout) while also building as a pip package.
